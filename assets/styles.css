@@ -206,6 +206,8 @@ td input { width: 64px; padding: 4px 6px; border: 1px solid var(--line); border-
   .hero, .result-top { grid-template-columns: 1fr; }
   .exam-grid { grid-template-columns: 1fr; }
   .palette { position: static; }
+  .exam-head { position: static; }
+  .exam-head .timer { position: fixed; right: 12px; bottom: 12px; z-index: 30; box-shadow: var(--shadow); }
   .pal-grid { grid-template-columns: repeat(6, 1fr); }
   .panes.three, .panes.two { grid-template-columns: 1fr; }
   .kpis { grid-template-columns: repeat(2, 1fr); }
@@ -215,3 +217,5 @@ td input { width: 64px; padding: 4px 6px; border: 1px solid var(--line); border-
   .facts { grid-template-columns: 1fr 1fr 1fr; }
   .score-big .num { font-size: 52px; }
 }
+
+.nowrap { white-space: nowrap; }

@@ -19,7 +19,7 @@ http
       return handler(req, res);
     }
     const p = normalize(join(root, url.pathname === '/' ? 'index.html' : url.pathname));
-    if (!p.startsWith(root)) return res.writeHead(403).end();
+    if (!p.startsWith(root) || /[\\/]\./.test(p.slice(root.length))) return res.writeHead(403).end();
     try {
       const body = await readFile(p);
       res.writeHead(200, { 'content-type': types[extname(p)] || 'application/octet-stream' }).end(body);

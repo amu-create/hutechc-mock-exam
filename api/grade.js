@@ -4,13 +4,15 @@ import { findQuestion } from '../lib/questions.js';
 import {
   ruleChecks,
   validateErrors,
+  dedupeAgainstRules,
   scoreErrors,
   combineRuns,
   gradeFor,
 } from '../lib/scoring.js';
 
 const MODEL = process.env.GRADER_MODEL || 'claude-sonnet-5-5';
-const DEFAULT_RUNS = Number(process.env.GRADER_RUNS || 3);
+const RUNS = Math.min(Math.max(Number(process.env.GRADER_RUNS || 3), 1), 5);
+const MAX_ANSWER = 4000;
 
 const ERROR_SCHEMA = {
   type: 'object',
@@ -81,7 +83,12 @@ const SYSTEM = `당신은 통번역 자격시험의 채점 보조자입니다. �
 원문(영): "Please do not reply to this email." / 답안(한): "이 메일에 답장해 주세요."
 → errors: [{category:"accuracy", subcategory:"mistranslation", severity:"critical", span:"답장해 주세요", source_span:"do not reply", explanation:"부정이 빠져 정반대 의미가 됨", suggestion:"답장하지 마십시오"}]`;
 
-function userPrompt(q, answer) {
+// 답안 안에 태그를 넣어 지시문 영역을 빠져나가는 것을 막는다
+function sanitizeAnswer(text) {
+  return String(text).replace(/<\/?\s*student_answer\s*>/gi, '[태그 제거]');
+}
+
+function userPrompt(q, answer, ruleErrors) {
   const glossary = (q.glossary || [])
     .map((g) => `- ${g.source} → ${[].concat(g.target).join(' / ')}`)
     .join('\n') || '- (없음)';
@@ -97,12 +104,15 @@ ${glossary}
 [모범답안(여러 정답 중 하나)]
 ${q.reference}
 
+[규칙 검사가 이미 찾은 문제 — 다시 세지 말 것]
+${ruleErrors.length ? ruleErrors.map((e) => `- ${e.explanation}`).join('\n') : '- (없음)'}
+
 <student_answer>
-${answer}
+${sanitizeAnswer(answer)}
 </student_answer>`;
 }
 
-async function callClaude(q, answer, signal) {
+async function callClaude(q, answer, ruleErrors, signal) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     signal,
@@ -113,9 +123,9 @@ async function callClaude(q, answer, signal) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 4000,
+      max_tokens: 16000,
       system: SYSTEM,
-      messages: [{ role: 'user', content: userPrompt(q, answer) }],
+      messages: [{ role: 'user', content: userPrompt(q, answer, ruleErrors) }],
       output_config: { format: { type: 'json_schema', schema: ERROR_SCHEMA } },
     }),
   });
@@ -124,8 +134,14 @@ async function callClaude(q, answer, signal) {
     throw new Error(`Claude API ${res.status}: ${body.slice(0, 300)}`);
   }
   const data = await res.json();
+  if (data.stop_reason === 'refusal') throw new Error('AI가 이 답안의 채점을 거절했습니다');
+  if (data.stop_reason === 'max_tokens') throw new Error('AI 응답이 길이 한도에서 잘렸습니다');
   const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error('AI 응답을 JSON으로 읽지 못했습니다');
+  }
 }
 
 function readBody(req) {
@@ -144,12 +160,14 @@ function readBody(req) {
   });
 }
 
-export async function gradeAnswer({ questionId, answer, runs, forceMock }) {
+export async function gradeAnswer({ questionId, answer, forceMock }) {
   const q = findQuestion(questionId);
   if (!q || q.type === 'choice') throw Object.assign(new Error('채점할 수 없는 문항'), { status: 400 });
-  const text = String(answer || '').slice(0, 4000);
+  const truncated = String(answer || '').length > MAX_ANSWER;
+  const text = String(answer || '').slice(0, MAX_ANSWER);
 
   const rules = ruleChecks(q, text);
+  if (truncated) rules.notes.push(`답안이 ${MAX_ANSWER}자를 넘어 앞부분만 채점했습니다.`);
   const useLLM = !forceMock && !!process.env.ANTHROPIC_API_KEY;
   const mode = useLLM ? 'llm' : 'rules-only';
 
@@ -162,19 +180,21 @@ export async function gradeAnswer({ questionId, answer, runs, forceMock }) {
   }
 
   let runResults;
+  let runsInfo = { requested: 1, ok: 1, failed: 0 };
   if (useLLM) {
-    const n = Math.min(Math.max(Number(runs) || DEFAULT_RUNS, 1), 5);
+    const n = RUNS;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 90_000);
     try {
       const settled = await Promise.allSettled(
-        Array.from({ length: n }, () => callClaude(q, text, controller.signal)),
+        Array.from({ length: n }, () => callClaude(q, text, rules.errors, controller.signal)),
       );
       const ok = settled.filter((s) => s.status === 'fulfilled').map((s) => s.value);
       if (!ok.length) {
         const reason = settled.find((s) => s.status === 'rejected')?.reason;
         throw Object.assign(new Error(`AI 채점 실패: ${reason?.message || '알 수 없음'}`), { status: 502 });
       }
+      runsInfo = { requested: n, ok: ok.length, failed: settled.length - ok.length };
       runResults = ok.map((out) => {
         const llmErrors = (out.errors || []).map((e) => ({ ...e, origin: 'ai' }));
         if (out.is_translation === false) {
@@ -183,9 +203,11 @@ export async function gradeAnswer({ questionId, answer, runs, forceMock }) {
             span: '', source_span: '', explanation: '번역이 아닌 답안으로 판정', origin: 'ai',
           });
         }
-        const { kept, dropped } = validateErrors([...rules.errors, ...llmErrors], text);
+        const ai = validateErrors(llmErrors, text);
+        const dd = dedupeAgainstRules(rules.errors, ai.kept);
+        const kept = [...validateErrors(rules.errors, text).kept, ...dd.kept];
         const s = scoreErrors(kept, q.source);
-        return { ...s, errors: kept, dropped, strengths: out.strengths || [], analysis: out.analysis || '' };
+        return { ...s, errors: kept, dropped: [...ai.dropped, ...dd.dropped], strengths: out.strengths || [], analysis: out.analysis || '' };
       });
     } finally {
       clearTimeout(timer);
@@ -205,8 +227,9 @@ export async function gradeAnswer({ questionId, answer, runs, forceMock }) {
     grade: gradeFor(combined.score),
     scores: combined.scores,
     range: combined.range,
-    needsReview: combined.needsReview,
-    notes: rules.notes,
+    needsReview: combined.needsReview || runsInfo.failed > 0,
+    runs: runsInfo,
+    notes: runsInfo.failed ? [...rules.notes, `AI 채점 ${runsInfo.requested}회 중 ${runsInfo.failed}회가 실패해 ${runsInfo.ok}회로 계산했습니다.`] : rules.notes,
     errors: rep.errors,
     dropped: rep.dropped,
     byCategory: rep.byCategory,
@@ -228,11 +251,16 @@ export default async function handler(req, res) {
     return;
   }
   try {
-    const body = await readBody(req);
+    let body;
+    try {
+      body = await readBody(req);
+    } catch {
+      res.status(400).json({ error: '요청 본문이 올바른 JSON이 아닙니다' });
+      return;
+    }
     const result = await gradeAnswer({
       questionId: body.questionId,
       answer: body.answer,
-      runs: body.runs,
       forceMock: body.mode === 'rules-only',
     });
     res.status(200).json(result);

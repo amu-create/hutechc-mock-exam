@@ -3,6 +3,7 @@ import { CATEGORIES, CATEGORY_LABEL, SCORING_CONFIG, gradeFor } from '/lib/scori
 
 const app = document.getElementById('app');
 const STORE_KEY = 'mockexam.attempts.v1';
+const SESSION_KEY = 'mockexam.session.v1';
 
 // ---------- 공통 ----------
 const esc = (s) =>
@@ -50,6 +51,7 @@ function setActiveNav() {
 
 // ---------- 상태 ----------
 const state = {
+  submitting: false,
   name: '',
   answers: {},
   flags: {},
@@ -60,6 +62,25 @@ const state = {
   alerted: {},
   lastResult: null,
 };
+
+// 진행 중 시험을 탭 세션에 저장 → 새로고침해도 답안·타이머 유지
+function persist() {
+  try {
+    if (!state.name) sessionStorage.removeItem(SESSION_KEY);
+    else sessionStorage.setItem(SESSION_KEY, JSON.stringify({ name: state.name, answers: state.answers, flags: state.flags, current: state.current, endsAt: state.endsAt, alerted: state.alerted }));
+  } catch {
+    /* 저장 불가 환경 */
+  }
+}
+function restore() {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(SESSION_KEY) || 'null');
+    if (saved?.name) Object.assign(state, saved);
+  } catch {
+    /* 무시 */
+  }
+}
+restore();
 
 // ---------- 홈 ----------
 async function renderHome() {
@@ -96,7 +117,7 @@ function homeHtml(mode) {
         <input id="name" maxlength="20" placeholder="예: 홍길동" value="${esc(state.name)}" autocomplete="name" />
       </label>
       <div class="row">
-        <button class="btn primary" id="start">시험 시작</button>
+        ${state.name ? `<button class="btn primary" id="resume">${esc(state.name)}님 시험 이어 하기</button><button class="btn" id="start">새로 시작</button>` : '<button class="btn primary" id="start">시험 시작</button>'}
         <span class="badge" id="mode-badge">${esc(mode)}</span>
       </div>
     </div>
@@ -114,7 +135,13 @@ function homeHtml(mode) {
 }
 
 function bindHome() {
+  const resume = document.getElementById('resume');
+  if (resume) resume.onclick = () => (location.hash = '#/exam');
+  document.getElementById('name').onkeydown = (e) => {
+    if (e.key === 'Enter') document.getElementById('start').click();
+  };
   document.getElementById('start').onclick = () => {
+    if (state.name && !confirm('진행 중인 답안을 지우고 새로 시작할까요?')) return;
     const name = document.getElementById('name').value.trim();
     if (!name) {
       toast('수험자 이름을 입력해 주세요');
@@ -127,6 +154,8 @@ function bindHome() {
     state.current = 0;
     state.alerted = {};
     state.endsAt = Date.now() + EXAM.minutes * 60_000;
+    state.submitting = false;
+    persist();
     location.hash = '#/exam';
   };
 }
@@ -152,6 +181,7 @@ function tick() {
   for (const m of [10, 5]) {
     if (left <= m * 60_000 && !state.alerted[m] && left > 0) {
       state.alerted[m] = true;
+      persist();
       toast(`시험 종료 ${m}분 전입니다`);
     }
   }
@@ -168,6 +198,10 @@ function isAnswered(q) {
 }
 
 function renderExam() {
+  if (state.submitting) {
+    app.innerHTML = `<div class="card grading"><div class="spinner"></div><h2 style="margin:0">채점 중입니다</h2></div>`;
+    return;
+  }
   if (!state.name) {
     location.hash = '#/';
     return;
@@ -239,6 +273,7 @@ function bindExam(q) {
   document.getElementById('next').onclick = () => go(state.current + 1);
   document.getElementById('flag').onchange = (e) => {
     state.flags[q.id] = e.target.checked;
+    persist();
     renderExam();
   };
   document.getElementById('submit').onclick = confirmSubmit;
@@ -252,6 +287,7 @@ function bindExam(q) {
   };
   document.querySelectorAll('.choice').forEach((b) => (b.onclick = () => {
     state.answers[q.id] = Number(b.dataset.c);
+    persist();
     renderExam();
   }));
   document.querySelectorAll('.tab').forEach((b) => (b.onclick = () => {
@@ -262,6 +298,7 @@ function bindExam(q) {
   if (ta) {
     ta.oninput = () => {
       state.answers[q.id] = ta.value;
+      persist();
       document.getElementById('count').textContent = `${ta.value.length}자`;
       document.querySelectorAll('.pal-btn')[state.current].classList.toggle('done', isAnswered(q));
     };
@@ -278,6 +315,7 @@ function bindExam(q) {
 function go(i) {
   if (i < 0 || i >= QUESTIONS.length) return;
   state.current = i;
+  persist();
   renderExam();
 }
 
@@ -295,8 +333,11 @@ function confirmSubmit() {
 
 // ---------- 채점 ----------
 async function submit() {
+  if (state.submitting) return;
+  state.submitting = true;
+  closeModal();
   stopTimer();
-  app.innerHTML = `<div class="card grading"><div class="spinner"></div><h2 style="margin:0">채점 중입니다</h2><p class="muted" id="g-progress">주관식 답안을 문항마다 3번씩 채점하고 있어요.</p></div>`;
+  app.innerHTML = `<div class="card grading"><div class="spinner"></div><h2 style="margin:0">채점 중입니다</h2><p class="muted" id="g-progress">주관식 답안을 채점하고 있어요. AI 채점이 켜져 있으면 문항마다 여러 번 채점해 중앙값을 씁니다.</p></div>`;
   const trans = QUESTIONS.filter((q) => q.type !== 'choice');
   let done = 0;
   const results = await Promise.all(
@@ -331,12 +372,13 @@ async function submit() {
   });
   const pending = items.some((i) => i.earned == null);
   const total = Math.round(items.reduce((a, i) => a + (i.earned || 0), 0) * 10) / 10;
+  // 채점 실패 문항이 있으면 급수를 확정하지 않는다
   const attempt = {
     id: `A${Date.now().toString(36).toUpperCase()}`,
     name: state.name,
     at: new Date().toISOString(),
     total,
-    grade: gradeFor(total),
+    grade: pending ? '미확정' : gradeFor(total),
     pending,
     needsReview: items.some((i) => i.grade?.needsReview),
     mode: results.find((r) => r.mode)?.mode || 'unknown',
@@ -349,7 +391,12 @@ async function submit() {
   saveAttempts(list.slice(0, 50));
   state.lastResult = attempt;
   state.name = '';
-  location.hash = `#/result/${attempt.id}`;
+  state.answers = {};
+  state.flags = {};
+  state.submitting = false;
+  persist();
+  if ((location.hash || '').startsWith('#/exam')) location.hash = `#/result/${attempt.id}`;
+  else toast('채점이 끝났습니다. 관리자 화면 응시 기록에서 결과를 볼 수 있어요.', 4000);
 }
 
 // ---------- 결과 ----------
@@ -367,7 +414,7 @@ function highlight(answer, errors) {
   let pos = 0;
   for (const s of spans) {
     out += esc(answer.slice(pos, s.start));
-    out += `<mark class="${s.e.severity}" title="${esc(`${CATEGORY_LABEL[s.e.category]} · ${s.e.severity} — ${s.e.explanation}`)}">${esc(answer.slice(s.start, s.end))}</mark>`;
+    out += `<mark class="${esc(s.e.severity)}" title="${esc(`${CATEGORY_LABEL[s.e.category]} · ${s.e.severity} — ${s.e.explanation}`)}">${esc(answer.slice(s.start, s.end))}</mark>`;
     pos = s.end;
   }
   return out + esc(answer.slice(pos));
@@ -387,7 +434,7 @@ function renderResult(id) {
   <div class="result-top">
     <div class="card score-big">
       <div class="muted small">${esc(a.name)} · ${new Date(a.at).toLocaleString('ko-KR')}</div>
-      <div class="num">${a.total}</div>
+      <div class="num">${esc(a.total)}</div>
       <div class="grade">${esc(a.grade)}</div>
       <div class="row" style="justify-content:center;margin-top:10px">
         <span class="badge">${esc(modeLabel)}</span>
@@ -396,8 +443,8 @@ function renderResult(id) {
       </div>
     </div>
     <div class="card pad">
-      <h2 style="margin-top:0;font-size:17px">영역별 감점 (AI·규칙 합계)</h2>
-      <div class="bars">${CATEGORIES.map((c) => `<div class="bar-row"><span>${CATEGORY_LABEL[c]}</span><div class="bar loss"><i style="width:${(deductions[c] / maxDed) * 100}%"></i></div><span class="muted">-${deductions[c]}</span></div>`).join('')}</div>
+      <h2 style="margin-top:0;font-size:17px">영역별 감점 원점수 <span class="muted small">(critical 25 · major 5 · minor 1 합계, 정규화 전)</span></h2>
+      <div class="bars">${CATEGORIES.map((c) => `<div class="bar-row"><span>${esc(CATEGORY_LABEL[c])}</span><div class="bar loss"><i style="width:${(deductions[c] / maxDed) * 100}%"></i></div><span class="muted">-${deductions[c]}</span></div>`).join('')}</div>
       <h2 style="font-size:17px">문항별 득점</h2>
       <div class="bars">${a.items.map((it, i) => `<div class="bar-row"><span>${i + 1}번</span><div class="bar"><i style="width:${((it.earned || 0) / it.points) * 100}%"></i></div><span class="muted">${it.earned ?? '-'}/${it.points}</span></div>`).join('')}</div>
     </div>
@@ -443,7 +490,7 @@ function itemHtml(it, i) {
       ${g.blocked ? `<div class="notice">${esc(g.blocked)} → 0점</div>` : ''}
       ${(g.notes || []).map((n) => `<div class="notice">${esc(n)}</div>`).join('')}
       <div><div class="muted small" style="margin-bottom:4px">내 답안 (오류 구간 표시)</div><div class="answer-view">${highlight(it.answer || '', errs) || '<span class="muted">(빈 답안)</span>'}</div></div>
-      ${errs.length ? `<ul class="err-list">${errs.map((e) => `<li class="err"><span class="sev ${e.severity}">${e.severity.toUpperCase()}</span><div><b>${CATEGORY_LABEL[e.category]}</b> · ${esc(e.subcategory)} ${e.origin === 'rule' ? '<span class="badge">규칙</span>' : '<span class="badge ok">AI</span>'}<div>${esc(e.explanation)}</div>${e.suggestion ? `<div class="muted small">고친 표현: ${esc(e.suggestion)}</div>` : ''}${e.source_span ? `<div class="muted small">원문: ${esc(e.source_span)}</div>` : ''}</div></li>`).join('')}</ul>` : '<div class="muted small">발견된 오류가 없습니다.</div>'}
+      ${errs.length ? `<ul class="err-list">${errs.map((e) => `<li class="err"><span class="sev ${esc(e.severity)}">${esc(String(e.severity).toUpperCase())}</span><div><b>${esc(CATEGORY_LABEL[e.category] || e.category)}</b> · ${esc(e.subcategory)} ${e.origin === 'rule' ? '<span class="badge">규칙</span>' : '<span class="badge ok">AI</span>'}<div>${esc(e.explanation)}</div>${e.suggestion ? `<div class="muted small">고친 표현: ${esc(e.suggestion)}</div>` : ''}${e.source_span ? `<div class="muted small">원문: ${esc(e.source_span)}</div>` : ''}</div></li>`).join('')}</ul>` : '<div class="muted small">발견된 오류가 없습니다.</div>'}
       ${(g.strengths || []).length ? `<div class="small"><b>잘한 점</b> · ${g.strengths.map(esc).join(' / ')}</div>` : ''}
       <div class="runs small"><span class="muted">${g.mode === 'llm' ? `AI 채점 ${g.scores?.length || 0}회` : '규칙 채점'}:</span>${(g.scores || []).map((s) => `<span class="run-dot">${s}</span>`).join('')}<span class="muted">→ 중앙값 ${g.score}, 범위 ${g.range}</span>${g.dropped?.length ? `<span class="muted">· 답안에 없는 구간이라 버린 AI 지적 ${g.dropped.length}건</span>` : ''}</div>
       <details class="small"><summary class="muted">모범답안 (여러 정답 중 하나)</summary><div style="margin-top:6px">${esc(q.reference)}</div></details>
@@ -496,7 +543,7 @@ function renderAdmin() {
     <div class="table-wrap"><table>
       <thead><tr><th>응시번호</th><th>이름</th><th>일시</th><th>총점</th><th>급수</th><th>상태</th>${trans.map((q) => `<th>${QUESTIONS.indexOf(q) + 1}번 AI / 사람</th>`).join('')}</tr></thead>
       <tbody>${list.length ? list.map((a) => `<tr>
-        <td><a href="#/result/${a.id}">${a.id}</a></td><td>${esc(a.name)}</td><td class="small">${new Date(a.at).toLocaleString('ko-KR')}</td>
+        <td><a href="#/result/${esc(a.id)}">${esc(a.id)}</a></td><td class="nowrap">${esc(a.name)}</td><td class="small">${new Date(a.at).toLocaleString('ko-KR')}</td>
         <td><b>${a.total}</b></td><td>${esc(a.grade)}</td>
         <td>${a.needsReview ? '<span class="badge warn">검토</span>' : ''}${a.appeal ? '<span class="badge crit">이의</span>' : ''}${a.mode === 'llm' ? '' : '<span class="badge">규칙만</span>'}</td>
         ${trans.map((q) => {
@@ -549,4 +596,7 @@ function route() {
   window.scrollTo(0, 0);
 }
 window.addEventListener('hashchange', route);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+});
 route();
