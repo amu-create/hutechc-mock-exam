@@ -1,0 +1,14 @@
+{
+  "name": "hutechc-mock-exam",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 번역 전문가 모의시험 + 주관식 번역 답안 자동채점 데모 (규칙 검사 + Claude 오류 검출 + 코드 점수 계산)",
+  "scripts": {
+    "dev": "node dev-server.mjs",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
